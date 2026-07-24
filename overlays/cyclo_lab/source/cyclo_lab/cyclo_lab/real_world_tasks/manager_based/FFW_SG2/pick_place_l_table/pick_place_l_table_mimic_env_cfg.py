@@ -20,6 +20,7 @@ from cyclo_lab.real_world_tasks.manager_based.FFW_SG2.mimic_dual_arm import conf
 from cyclo_lab.real_world_tasks.manager_based.FFW_SG2.pick_place_l_table.joint_pos_env_cfg import (
     EventCfg,
     FFWSG2PickPlaceLTableEnvCfg,
+    FFWSG2PickPlaceLTableMobileEnvCfg,
 )
 
 from . import mdp
@@ -48,6 +49,31 @@ class FFWSG2PickPlaceLTableMimicEnvCfg(FFWSG2PickPlaceLTableEnvCfg, MimicEnvCfg)
         configure_ltable_dual_arm_mimic(
             self,
             datagen_name="ltable_pick_place_box",
+            place_signal="box_on_left_table",
+            place_description="Place box on left table",
+        )
+
+
+@configclass
+class FFWSG2PickPlaceLTableMobileMimicEnvCfg(FFWSG2PickPlaceLTableMobileEnvCfg, MimicEnvCfg):
+    """Mimic config for the drivable-base (Plan B) L-table task.
+
+    Same L-table datagen as the stock mimic, but built on the mobile env so generated demos
+    keep the ``base_velocity`` observation (linear_x/y + angular_z). The IK action stays 19-dim
+    throughout datagen; the LeRobot converter appends base_velocity -> 22-dim, matching the real
+    ffw_sg2_rev1 mobile data. Base motion is reproduced by replaying the recorded root pose AND
+    velocity (see ``apply_recorded_robot_root_state``), so base_velocity is non-zero during the
+    drive. The stock 19-dim mimic task is left untouched.
+    """
+
+    scripted_l_motion_enable: bool = False
+    events: LTableMimicEventCfg = LTableMimicEventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        configure_ltable_dual_arm_mimic(
+            self,
+            datagen_name="ltable_pick_place_box_mobile",
             place_signal="box_on_left_table",
             place_description="Place box on left table",
         )

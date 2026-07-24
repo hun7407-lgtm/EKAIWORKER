@@ -92,6 +92,7 @@ import isaaclab_mimic.envs  # noqa: F401
 
 if args_cli.enable_pinocchio:
     import isaaclab_mimic.envs.pinocchio_envs  # noqa: F401
+import os
 import pathlib
 import sys
 
@@ -108,11 +109,54 @@ import isaaclab_tasks  # noqa: F401
 import cyclo_lab  # noqa: F401
 
 
+def _postprocess_base_velocity(output_file_path: str) -> None:
+    """Append obs/base_velocity to each generated episode's actions so mobile output is 22-dim.
+
+    The datagen recorder writes the 19-dim joint/IK action; on mobile tasks the base is driven
+    off-action and captured as obs/base_velocity. This runs after the sim app closes (file handle
+    released) and rewrites the actions dataset to [19-dim action | 3-dim base velocity]. No-op for
+    teleport tasks (no base_velocity) or episodes whose actions were already packed.
+    """
+    import h5py
+
+    if not output_file_path.endswith(".hdf5"):
+        output_file_path = output_file_path + ".hdf5"
+    if not os.path.exists(output_file_path):
+        return
+
+    base_key = "base_velocity"
+    packed = 0
+    with h5py.File(output_file_path, "r+") as f:
+        if "data" not in f:
+            return
+        for demo_name in list(f["data"].keys()):
+            g = f["data"][demo_name]
+            if "obs" not in g or base_key not in g["obs"] or "actions" not in g:
+                continue
+            actions = g["actions"][:]
+            base = g["obs"][base_key][:]
+            ref_dim = g["obs"]["joint_pos"].shape[1] if "joint_pos" in g["obs"] else actions.shape[1]
+            # Skip if already packed (actions already carry the base channels).
+            if actions.shape[1] != ref_dim:
+                continue
+            if base.shape[0] != actions.shape[0]:
+                continue
+            import numpy as np
+
+            new_actions = np.concatenate([actions, base.astype(actions.dtype)], axis=1)
+            del g["actions"]
+            g.create_dataset("actions", data=new_actions)
+            packed += 1
+    if packed:
+        print(f"[base_velocity] Repacked {packed} episode(s) to 22-dim actions in {output_file_path}")
+
+
 def main():
     num_envs = args_cli.num_envs
 
     # Setup output paths and get env name
     output_dir, output_file_name = setup_output_paths(args_cli.output_file)
+    output_file_path = os.path.join(output_dir, output_file_name + ".hdf5")
     task_name = args_cli.task
     if task_name:
         task_name = args_cli.task.split(":")[-1]
@@ -219,10 +263,22 @@ def main():
                     planner.plan_visualizer = None
             motion_planners.clear()
 
+    # Re-attach base velocity so generated mobile actions are 22-dim. Run BEFORE
+    # simulation_app.close(): Isaac's app teardown can hard-exit the process, so work placed after
+    # it may never run. Wrapped defensively so a repack issue never discards a long datagen run;
+    # if it is skipped, rerun action_data_converter (joint step) which also packs base velocity.
+    try:
+        _postprocess_base_velocity(output_file_path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[base_velocity] WARNING: post-process skipped ({exc}); actions left at env dim.")
+
+    return output_file_path
+
 
 if __name__ == "__main__":
+    output_file_path = None
     try:
-        main()
+        output_file_path = main()
     except KeyboardInterrupt:
         print("\nProgram interrupted by user. Exiting...")
     # Close sim app

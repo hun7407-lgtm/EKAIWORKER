@@ -346,6 +346,16 @@ def main():
     )  # This line is used by the dataset generation test case to check if the expected number of demos were annotated
     print("Exiting the app.")
 
+    # Re-attach base velocity so the exported mobile actions are 22-dim. Run this BEFORE
+    # simulation_app.close(): Isaac's app teardown can hard-exit the process, so any work placed
+    # after it may never run. The recorder already flushed/closed the file in export_episodes(),
+    # so the on-disk file is safe to reopen here.
+    exported_output_file = os.path.join(output_dir, output_file_name + ".hdf5")
+    try:
+        _postprocess_base_velocity(exported_output_file, env.action_manager.total_action_dim)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[base_velocity] WARNING: post-process skipped ({exc}); actions left at env dim.")
+
     # Close environment after annotation is complete
     env.close()
 
@@ -386,6 +396,48 @@ def _apply_recorded_step_state(env: ManagerBasedRLMimicEnv, episode: EpisodeData
     env.scene.reset_to(step_state, env_ids=None, is_relative=True)
     env.sim.forward()
     return True
+
+
+BASE_VELOCITY_OBS_KEY = "base_velocity"
+
+
+def _postprocess_base_velocity(output_file_path: str, env_action_dim: int) -> None:
+    """Append obs/base_velocity to each annotated episode's actions so mobile output is 22-dim.
+
+    The env action manager records the 19-dim joint/IK action; on mobile tasks the base is driven
+    off-action (teleport / external cmd_vel) and captured as obs/base_velocity. This runs after the
+    sim app closes (file handle released) and rewrites the actions dataset to
+    [joint/IK action | base velocity]. No-op for teleport tasks (no base_velocity) or episodes
+    whose actions were already packed.
+    """
+    import h5py
+    import numpy as np
+
+    if not output_file_path.endswith(".hdf5"):
+        output_file_path = output_file_path + ".hdf5"
+    if not os.path.exists(output_file_path):
+        return
+
+    packed = 0
+    with h5py.File(output_file_path, "r+") as f:
+        if "data" not in f:
+            return
+        for demo_name in list(f["data"].keys()):
+            g = f["data"][demo_name]
+            if "obs" not in g or BASE_VELOCITY_OBS_KEY not in g["obs"] or "actions" not in g:
+                continue
+            actions = g["actions"][:]
+            base = g["obs"][BASE_VELOCITY_OBS_KEY][:]
+            if actions.shape[1] != env_action_dim:
+                continue  # already packed or unexpected layout
+            if base.shape[0] != actions.shape[0]:
+                continue
+            new_actions = np.concatenate([actions, base.astype(actions.dtype)], axis=1)
+            del g["actions"]
+            g.create_dataset("actions", data=new_actions)
+            packed += 1
+    if packed:
+        print(f"[base_velocity] Repacked {packed} annotated episode(s) to 22-dim actions.")
 
 
 def replay_episode(
@@ -431,7 +483,11 @@ def replay_episode(
                     return False
                 continue
         action_tensor = torch.Tensor(action).reshape([1, action.shape[0]])
-        env.step(torch.Tensor(action_tensor))
+        # Mobile IK actions carry 3 extra base-velocity channels (22-dim); the sim action
+        # manager is 19-dim, so feed only the joint/IK channels. The base velocity stays in
+        # the recorded obs and is re-attached to the exported action (see main()).
+        env_action_dim = env.action_manager.total_action_dim
+        env.step(torch.Tensor(action_tensor)[:, :env_action_dim])
         if replay_recorded_states:
             _apply_recorded_step_state(env, episode, action_index)
     if success_term is not None:

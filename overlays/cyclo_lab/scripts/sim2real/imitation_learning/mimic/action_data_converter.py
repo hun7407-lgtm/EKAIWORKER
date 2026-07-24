@@ -62,6 +62,32 @@ def _ffw_sg2_joint_action_indices(num_actions: int) -> tuple[int, int, slice, sl
     raise ValueError(f"FFW_SG2 joint actions expected 19 or 22 dims, got {num_actions}")
 
 
+# Drivable-base (mobile) tasks record obs/base_velocity = [linear_x, linear_y, angular_z].
+# To keep the whole datagen pipeline at 22 dims on mobile tasks (matching real ffw_sg2_rev1),
+# the base velocity is appended as the last 3 action channels here. Non-mobile (teleport) tasks
+# have no base_velocity obs and stay 19-dim.
+BASE_VELOCITY_OBS_KEY = "base_velocity"
+
+
+def _base_velocity_or_none(ep_data: EpisodeData) -> torch.Tensor | None:
+    obs = ep_data.data.get("obs")
+    if isinstance(obs, dict) and BASE_VELOCITY_OBS_KEY in obs:
+        return obs[BASE_VELOCITY_OBS_KEY]
+    return None
+
+
+def _append_base_velocity(new_actions: torch.Tensor, ep_data: EpisodeData) -> torch.Tensor:
+    """Append recorded base velocity to the action so mobile actions are 22-dim; no-op otherwise."""
+    base_velocity = _base_velocity_or_none(ep_data)
+    if base_velocity is None:
+        return new_actions
+    if base_velocity.shape[0] != new_actions.shape[0]:
+        raise ValueError(
+            f"base_velocity length {base_velocity.shape[0]} != action length {new_actions.shape[0]}"
+        )
+    return torch.cat([new_actions, base_velocity.to(new_actions.dtype)], dim=1)
+
+
 _FFW_SH5_JOINT_DIM = 57
 _FFW_SH5_FINGER_L = slice(7, 27)
 _FFW_SH5_FINGER_R = slice(34, 54)
@@ -124,6 +150,7 @@ def convert_joint_to_ik_ffw_sg2(ep_data: EpisodeData) -> EpisodeData:
 
         # IK action order (total 19):
         # [left_eef(7), gripper_l(1), right_eef(7), gripper_r(1), head(2), lift(1)]
+        # On mobile tasks, base velocity [linear_x, linear_y, angular_z] is appended -> 22.
         new_actions = torch.cat([
             left_eef_pose,    # 0-6: left EEF (pos + quat)
             gripper_l_action,  # 7: left gripper
@@ -133,7 +160,7 @@ def convert_joint_to_ik_ffw_sg2(ep_data: EpisodeData) -> EpisodeData:
             lift_action       # 18: lift joint
         ], dim=1)
 
-        ep_data.data["actions"] = new_actions
+        ep_data.data["actions"] = _append_base_velocity(new_actions, ep_data)
         return ep_data
     except (KeyError, IndexError, TypeError) as e:
         raise ValueError(f"Failed to convert joint to IK for FFW_SG2: {str(e)}")
@@ -150,10 +177,10 @@ def convert_joint_to_ik(ep_data: EpisodeData, robot_type: str) -> EpisodeData:
         raise ValueError(f"Unknown robot type: {robot_type}")
 
 def convert_ik_to_joint(ep_data: EpisodeData) -> EpisodeData:
-    """Convert IK actions to joint targets."""
+    """Convert IK actions to joint targets (mobile: append base velocity -> 22 dims)."""
     try:
         joint_targets = ep_data.data["obs"]["joint_pos_target"]
-        ep_data.data["actions"] = joint_targets
+        ep_data.data["actions"] = _append_base_velocity(joint_targets, ep_data)
         return ep_data
     except (KeyError, IndexError, TypeError) as e:
         raise ValueError(f"Failed to convert IK to joint: {str(e)}")
